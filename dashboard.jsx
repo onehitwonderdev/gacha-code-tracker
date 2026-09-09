@@ -8,8 +8,8 @@ import { Copy, Check, ExternalLink, Clock, Gift, Loader2 } from "lucide-react";
 // access your RLS policies grant it (see supabase_setup.sql - the
 // "Public can read game codes" policy is what makes this work).
 // ---------------------------------------------------------------------------
-const SUPABASE_URL = "https://YOUR_PROJECT_REF.supabase.co";
-const SUPABASE_ANON_KEY = "YOUR_PUBLISHABLE_KEY";
+const SUPABASE_URL = "https://zgzbchsuzjxronkzrlwk.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_c5eCZcct5rbOkdgoSPrU8Q_r6u_54Lz";
 
 // Legacy `anon` keys are JWTs and need Authorization: Bearer; new
 // sb_publishable_... keys are opaque and only need the apikey header
