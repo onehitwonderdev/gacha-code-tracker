@@ -1,0 +1,44 @@
+name: Scrape codes (stream radar mode)
+
+# FR-3 Stream Radar Mode: poll every 2 minutes during known livestream
+# windows (45-90 min). This workflow is ALWAYS scheduled at 2-minute
+# intervals, but every run checks the STREAM_RADAR_ACTIVE repo variable
+# and exits immediately unless it's "true" - so it costs almost nothing
+# outside of an actual livestream window, and you don't have to edit/push
+# YAML every time you want to turn it on or off.
+#
+# To activate before a livestream:
+#   Repo -> Settings -> Secrets and variables -> Actions -> Variables tab
+#   -> set STREAM_RADAR_ACTIVE = true
+# Turn it back to "false" once the window has passed (45-90 min later).
+on:
+  schedule:
+    - cron: '*/2 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  check-and-scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if stream radar mode is off
+        if: ${{ vars.STREAM_RADAR_ACTIVE != 'true' }}
+        run: echo "Stream Radar Mode is off - skipping run." && exit 0
+
+      - uses: actions/checkout@v4
+        if: ${{ vars.STREAM_RADAR_ACTIVE == 'true' }}
+
+      - uses: actions/setup-python@v5
+        if: ${{ vars.STREAM_RADAR_ACTIVE == 'true' }}
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: ${{ vars.STREAM_RADAR_ACTIVE == 'true' }}
+        run: pip install requests beautifulsoup4
+
+      - name: Run ingestion pipeline
+        if: ${{ vars.STREAM_RADAR_ACTIVE == 'true' }}
+        run: python scraper.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
