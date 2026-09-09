@@ -42,7 +42,7 @@ GAMES = {
 
 # Reddit requires a descriptive User-Agent or it will 429 you.
 HEADERS = {
-    "User-Agent": "python:gacha_tracker_bot:v1.0 (by /u/Own_Conversation9224)"
+    "User-Agent": "python:gacha_tracker_bot:v1.0 (by /u/your_reddit_username)"
 }
 
 # Uppercase alphanumeric, 6-16 chars - typical gacha code shape.
@@ -153,11 +153,31 @@ def fetch_reddit_codes(game_id: str, subreddit: str) -> list[dict]:
                     "code_type": classify_code(game_id, code, title, text),
                     "rewards": extract_rewards(title, text),
                     "source_url": f"https://reddit.com{data.get('permalink')}",
+                    "status": "ACTIVE",  # freshly posted - assume active at time of discovery
                 })
     except Exception as e:
         print(f"[!] Reddit fetch failed for {game_id}: {e}")
 
     return found
+
+
+def _section_status_for(tag) -> str:
+    """
+    Walks backwards from a <code> tag to the nearest preceding heading (h2/h3/h4)
+    to figure out whether it's in an 'active' or 'expired' section of the wiki page.
+    Fandom code pages almost always split codes into two tables like this - if we
+    don't check which one a code came from, an expired code gets scraped as ACTIVE.
+    """
+    EXPIRED_WORDS = ("expired", "inactive", "old code", "no longer")
+    for heading in tag.find_all_previous(["h2", "h3", "h4"]):
+        heading_text = heading.get_text(" ", strip=True).lower()
+        if any(w in heading_text for w in EXPIRED_WORDS):
+            return "EXPIRED"
+        # First heading found going backwards that ISN'T about expired codes -
+        # assume it marks the start of the active section, stop looking further up.
+        if heading_text:
+            return "ACTIVE"
+    return "ACTIVE"  # no heading found at all - default to active rather than guess wrong
 
 
 def fetch_wiki_codes(game_id: str, api_url: str, page_title: str) -> list[dict]:
@@ -183,12 +203,15 @@ def fetch_wiki_codes(game_id: str, api_url: str, page_title: str) -> list[dict]:
             if parent_row:
                 row_text = parent_row.get_text(" ", strip=True)
 
+            status = _section_status_for(code_tag)
+
             found.append({
                 "game": game_id,
                 "code": code_text,
                 "code_type": classify_code(game_id, code_text, "", row_text),
                 "rewards": extract_rewards("", row_text),
                 "source_url": f"{api_url.split('/api.php')[0]}/wiki/{page_title}",
+                "status": status,
             })
     except Exception as e:
         print(f"[!] Wiki fetch failed for {game_id}: {e}")
@@ -203,21 +226,56 @@ def fetch_wiki_codes(game_id: str, api_url: str, page_title: str) -> list[dict]:
 def dedupe(master_list: list[dict]) -> list[dict]:
     """In-memory dedup by (game, code) before we even hit the DB - cheap first pass."""
     unique = {}
+    now = datetime.now(timezone.utc)
+
     for item in master_list:
         key = (item["game"], item["code"])
-        if key not in unique:
-            unique[key] = {
-                "game": item["game"],
-                "code": item["code"],
-                "code_type": item["code_type"],
-                "rewards": item["rewards"],
-                "status": "ACTIVE",
-                "discovered_at": datetime.now(timezone.utc).isoformat(),
-                "expires_at": None,  # Set manually/admin-side, or by a future expiry-inference pass
-                "source_url": item["source_url"],
-                "direct_redeem_url": get_redeem_link(item["game"], item["code"]),
-            }
+        if key in unique:
+            # If we've already seen this code and EITHER source says EXPIRED,
+            # prefer EXPIRED - it's a stronger signal than an ACTIVE guess.
+            if item.get("status") == "EXPIRED":
+                unique[key]["status"] = "EXPIRED"
+            continue
+
+        code_type = item["code_type"]
+        status = item.get("status", "ACTIVE")
+
+        # PDR Section 1: livestream codes expire in ~12-24h. We don't get an
+        # exact expiry from any source, so seed a conservative 24h estimate
+        # rather than leaving expires_at null - null reads as "Permanent" on
+        # the dashboard, which is actively misleading for a code this short-lived.
+        # Treat this as a starting estimate an admin can correct (FR-5).
+        expires_at = None
+        if code_type == "LIVESTREAM" and status == "ACTIVE":
+            expires_at = (now.timestamp() + 24 * 3600)
+            expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+
+        unique[key] = {
+            "game": item["game"],
+            "code": item["code"],
+            "code_type": code_type,
+            "rewards": item["rewards"],
+            "status": status,
+            "discovered_at": now.isoformat(),
+            "expires_at": expires_at,
+            "source_url": item["source_url"],
+            "direct_redeem_url": get_redeem_link(item["game"], item["code"]),
+        }
     return list(unique.values())
+
+
+def _supabase_headers(key: str) -> dict:
+    """
+    New-style keys (sb_secret_..., sb_publishable_...) are opaque, not JWTs -
+    Supabase's gateway rejects them if sent as Authorization: Bearer (it tries
+    to parse that header as a JWT and fails). Only apikey is needed for those.
+    Legacy service_role JWTs (eyJ...) still need Authorization for PostgREST
+    to read the role claim.
+    """
+    headers = {"apikey": key}
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 def upsert_to_supabase(rows: list[dict]) -> None:
@@ -236,8 +294,7 @@ def upsert_to_supabase(rows: list[dict]) -> None:
 
     endpoint = f"{url}/rest/v1/game_codes?on_conflict=game,code"
     headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
+        **_supabase_headers(key),
         "Content-Type": "application/json",
         # merge-duplicates: update status/rewards/etc. on conflict, don't skip silently
         "Prefer": "resolution=merge-duplicates,return=representation",
@@ -254,6 +311,37 @@ def upsert_to_supabase(rows: list[dict]) -> None:
             print(e.response.text)
 
 
+def expire_stale_codes() -> None:
+    """
+    Flips any code from ACTIVE to EXPIRED once its expires_at has passed.
+    This is the missing piece that actually verifies active/expired status
+    over time - without it, a LIVESTREAM code we seeded a 24h estimate for
+    (or a VERSION code with a manually-set expires_at) just sits ACTIVE
+    forever even after the clock runs out, since nothing else revisits it.
+    """
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    endpoint = f"{url}/rest/v1/game_codes?status=eq.ACTIVE&expires_at=lt.{now_iso}"
+    headers = {
+        **_supabase_headers(key),
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    try:
+        response = requests.patch(endpoint, headers=headers, json={"status": "EXPIRED"}, timeout=15)
+        response.raise_for_status()
+        updated = response.json()
+        if updated:
+            print(f"[+] Marked {len(updated)} code(s) EXPIRED (past their expires_at).")
+    except Exception as e:
+        print(f"[!] Expiry sweep failed: {e}")
+
+
 # --------------------------------------------------------------------------
 # Pipeline entrypoint
 # --------------------------------------------------------------------------
@@ -264,16 +352,14 @@ def run_pipeline():
 
     for game, config in GAMES.items():
         print(f"Fetching data for {game}...")
-        
-        # BYE REDDIT: Just comment this line out!
-        # master_list.extend(fetch_reddit_codes(game, config["reddit"]))
-        
-        # KEEP WIKI: This is all you actually need
+        master_list.extend(fetch_reddit_codes(game, config["reddit"]))
         master_list.extend(fetch_wiki_codes(game, config["wiki_url"], config["wiki_page"]))
 
     final_rows = dedupe(master_list)
     print(f"Pipeline complete. Discovered {len(final_rows)} unique candidate codes.")
+
     upsert_to_supabase(final_rows)
+    expire_stale_codes()
 
 
 if __name__ == "__main__":
