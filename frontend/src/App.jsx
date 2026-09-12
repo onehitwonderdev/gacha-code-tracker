@@ -1,5 +1,8 @@
 import { useState, useMemo, useEffect } from "react";
-import { Copy, Check, ExternalLink, Clock, Gift, Loader2 } from "lucide-react";
+import {
+  Copy, Check, ExternalLink, Clock, Gift, Loader2,
+  Search, ArrowUp, ArrowDown, ArrowUpDown, ChevronLeft, ChevronRight,
+} from "lucide-react";
 
 // ---------------------------------------------------------------------------
 // Fill these in with YOUR project's values (Project Settings > API Keys).
@@ -8,8 +11,8 @@ import { Copy, Check, ExternalLink, Clock, Gift, Loader2 } from "lucide-react";
 // access your RLS policies grant it (see supabase_setup.sql - the
 // "Public can read game codes" policy is what makes this work).
 // ---------------------------------------------------------------------------
-const SUPABASE_URL = "https://zgzbchsuzjxronkzrlwk.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_c5eCZcct5rbOkdgoSPrU8Q_r6u_54Lz";
+const SUPABASE_URL = "https://YOUR_PROJECT_REF.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR_PUBLISHABLE_KEY";
 
 // Legacy `anon` keys are JWTs and need Authorization: Bearer; new
 // sb_publishable_... keys are opaque and only need the apikey header
@@ -37,6 +40,8 @@ const MOCK_CODES = [
   { id: 6, game: "WUWA", code: "WUTHERINGGIFT", code_type: "PERMANENT", rewards: "50 Astrites", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
   { id: 7, game: "HSR", code: "HSRTWITCHDROP", code_type: "PROMO", rewards: "1 Stellar Jade x40 pull ticket bundle", status: "ACTIVE", expires_at: daysFromNow(2), direct_redeem_url: "https://hsr.hoyoverse.com/gift?code=HSRTWITCHDROP" },
   { id: 8, game: "WUWA", code: "TIDALWAVE500", code_type: "LIVESTREAM", rewards: "500 Astrites, 100000 Shell Credits", status: "ACTIVE", expires_at: hoursFromNow(14), direct_redeem_url: null },
+  { id: 9, game: "WUWA", code: "DCARD3VN7M", code_type: "PROMO", rewards: "Rewards unspecified - check source", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
+  { id: 10, game: "WUWA", code: "BAHAMUTKXMHM", code_type: "PROMO", rewards: "Rewards unspecified - check source", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
 ];
 
 function hoursFromNow(h) { return new Date(Date.now() + h * 3600 * 1000).toISOString(); }
@@ -49,19 +54,25 @@ const GAME_META = {
 };
 
 const TYPE_META = {
-  LIVESTREAM: { label: "Livestream", color: "#FF5C7A" },
-  VERSION:    { label: "Version",    color: "#6FA8FF" },
-  PROMO:      { label: "Promo",      color: "#F2C230" },
-  PERMANENT:  { label: "Permanent",  color: "#8A8496" },
+  LIVESTREAM: { label: "Livestream", color: "#FF5C7A", order: 0 },
+  VERSION:    { label: "Version",    color: "#6FA8FF", order: 1 },
+  PROMO:      { label: "Promo",      color: "#F2C230", order: 2 },
+  PERMANENT:  { label: "Permanent",  color: "#8A8496", order: 3 },
 };
 
-function timeRemaining(expiresAt) {
-  if (!expiresAt) return { label: "Permanent", urgent: false };
+// Distinguishes an actual "never expires" starter code from a time-limited
+// code we just don't have a known end date for yet - conflating the two
+// is what made every un-dated WuWa promo code read as "Permanent" before.
+function timeRemaining(expiresAt, codeType) {
+  if (codeType === "PERMANENT") return { label: "Permanent", urgent: false, sortValue: Infinity };
+  if (!expiresAt) return { label: "Unknown", urgent: false, sortValue: Infinity - 1 };
+
   const diffMs = new Date(expiresAt).getTime() - Date.now();
-  if (diffMs <= 0) return { label: "Expired", urgent: false };
+  if (diffMs <= 0) return { label: "Expired", urgent: false, sortValue: -Infinity };
+
   const hrs = diffMs / 3600000;
-  if (hrs < 24) return { label: `~${Math.round(hrs)}h left`, urgent: hrs <= 12 };
-  return { label: `~${Math.round(hrs / 24)}d left`, urgent: false };
+  if (hrs < 24) return { label: `~${Math.round(hrs)}h left`, urgent: hrs <= 12, sortValue: diffMs };
+  return { label: `~${Math.round(hrs / 24)}d left`, urgent: false, sortValue: diffMs };
 }
 
 function CopyButton({ code }) {
@@ -112,7 +123,7 @@ function ActionButton({ item }) {
 }
 
 function TypeBadge({ type }) {
-  const meta = TYPE_META[type];
+  const meta = TYPE_META[type] ?? { label: type, color: "#8A8496" };
   return (
     <span
       className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium"
@@ -124,12 +135,12 @@ function TypeBadge({ type }) {
   );
 }
 
-function ExpiryBadge({ expiresAt }) {
-  const { label, urgent } = timeRemaining(expiresAt);
+function ExpiryBadge({ expiresAt, codeType }) {
+  const { label, urgent } = timeRemaining(expiresAt, codeType);
   return (
     <span
       className="inline-flex items-center gap-1 text-xs font-medium"
-      style={{ color: urgent ? "#FF5C7A" : "#B7B2C6" }}
+      style={{ color: urgent ? "#FF5C7A" : label === "Unknown" ? "#6B6678" : "#B7B2C6" }}
     >
       <Clock size={12} />
       {label}
@@ -137,11 +148,38 @@ function ExpiryBadge({ expiresAt }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Sortable header cell
+// ---------------------------------------------------------------------------
+function SortHeader({ label, sortKey, activeSort, onSort }) {
+  const isActive = activeSort.key === sortKey;
+  const Icon = isActive ? (activeSort.dir === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <th className="px-4 py-3 font-medium">
+      <button
+        onClick={() => onSort(sortKey)}
+        className="inline-flex items-center gap-1 transition-colors hover:text-[#F3F1F8]"
+        style={{ color: isActive ? "#F3F1F8" : "#8A8496" }}
+      >
+        {label}
+        <Icon size={12} strokeWidth={2.25} className={isActive ? "" : "opacity-40"} />
+      </button>
+    </th>
+  );
+}
+
+const PAGE_SIZE_OPTIONS = [10, 25, 50];
+
 export default function GachaCodeTracker() {
   const [tab, setTab] = useState("ALL");
   const [codes, setCodes] = useState([]);
   const [loading, setLoading] = useState(true);
   const [usingMock, setUsingMock] = useState(false);
+
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState({ key: "urgency", dir: "asc" });
+  const [pageSize, setPageSize] = useState(10);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     const isPlaceholder = SUPABASE_URL.includes("YOUR_PROJECT_REF") || SUPABASE_ANON_KEY.includes("YOUR_PUBLISHABLE_KEY");
@@ -179,21 +217,64 @@ export default function GachaCodeTracker() {
     { key: "WUWA", label: "Wuthering" },
   ];
 
-  const rows = useMemo(() => {
-    const filtered = tab === "ALL" ? codes : codes.filter((c) => c.game === tab);
-    // Livestream codes float to the top - they're the ones about to expire.
-    return [...filtered].sort((a, b) => {
-      const order = { LIVESTREAM: 0, VERSION: 1, PROMO: 2, PERMANENT: 3 };
-      return (order[a.code_type] ?? 9) - (order[b.code_type] ?? 9);
+  // Reset to page 1 whenever the active filters change, so you never land
+  // on a now-empty page after narrowing a search or switching games.
+  useEffect(() => { setPage(1); }, [tab, search, pageSize]);
+
+  const handleSort = (key) => {
+    setSort((prev) => (prev.key === key ? { key, dir: prev.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
+  };
+
+  const filteredRows = useMemo(() => {
+    let list = tab === "ALL" ? codes : codes.filter((c) => c.game === tab);
+
+    const q = search.trim().toLowerCase();
+    if (q) {
+      list = list.filter((c) =>
+        c.code.toLowerCase().includes(q) ||
+        (c.rewards ?? "").toLowerCase().includes(q) ||
+        (GAME_META[c.game]?.label ?? c.game).toLowerCase().includes(q)
+      );
+    }
+    return list;
+  }, [tab, search, codes]);
+
+  const sortedRows = useMemo(() => {
+    const list = [...filteredRows];
+    const dirMult = sort.dir === "asc" ? 1 : -1;
+
+    list.sort((a, b) => {
+      switch (sort.key) {
+        case "game":
+          return dirMult * a.game.localeCompare(b.game);
+        case "code":
+          return dirMult * a.code.localeCompare(b.code);
+        case "type":
+          return dirMult * ((TYPE_META[a.code_type]?.order ?? 9) - (TYPE_META[b.code_type]?.order ?? 9));
+        case "expiry": {
+          const av = timeRemaining(a.expires_at, a.code_type).sortValue;
+          const bv = timeRemaining(b.expires_at, b.code_type).sortValue;
+          return dirMult * (av - bv);
+        }
+        case "urgency":
+        default:
+          // Default view: soonest-to-expire first, regardless of asc/desc toggle state.
+          return (TYPE_META[a.code_type]?.order ?? 9) - (TYPE_META[b.code_type]?.order ?? 9);
+      }
     });
-  }, [tab, codes]);
+    return list;
+  }, [filteredRows, sort]);
+
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const clampedPage = Math.min(page, totalPages);
+  const pageRows = sortedRows.slice((clampedPage - 1) * pageSize, clampedPage * pageSize);
 
   return (
     <div
       className="min-h-screen w-full px-4 py-8 sm:px-8"
       style={{ background: "#15121C", fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
     >
-      <div className="mx-auto max-w-4xl">
+      <div className="mx-auto max-w-5xl">
         {/* Header */}
         <div className="mb-7 flex items-start gap-3">
           <div
@@ -221,7 +302,7 @@ export default function GachaCodeTracker() {
         )}
 
         {/* Tabs */}
-        <div className="mb-5 flex gap-1.5 overflow-x-auto rounded-lg bg-white/[0.03] p-1">
+        <div className="mb-4 flex gap-1.5 overflow-x-auto rounded-lg bg-white/[0.03] p-1">
           {tabs.map((t) => (
             <button
               key={t.key}
@@ -237,6 +318,33 @@ export default function GachaCodeTracker() {
           ))}
         </div>
 
+        {/* Search + page size controls */}
+        <div className="mb-4 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="relative flex-1 sm:max-w-xs">
+            <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#6B6678]" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search code or reward..."
+              className="w-full rounded-lg border border-white/[0.08] bg-white/[0.03] py-1.5 pl-8 pr-3 text-sm text-[#F3F1F8] placeholder:text-[#6B6678] outline-none focus:border-white/20"
+            />
+          </div>
+          <div className="flex items-center gap-2 text-xs text-[#8A8496]">
+            Show
+            <select
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              className="rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-[#F3F1F8] outline-none"
+            >
+              {PAGE_SIZE_OPTIONS.map((n) => (
+                <option key={n} value={n} style={{ background: "#1E1A29" }}>{n}</option>
+              ))}
+            </select>
+            per page
+          </div>
+        </div>
+
         {loading && (
           <div className="flex items-center justify-center gap-2 py-16 text-sm text-[#8A8496]">
             <Loader2 size={16} className="animate-spin" />
@@ -250,17 +358,17 @@ export default function GachaCodeTracker() {
           <table className="w-full border-collapse text-sm">
             <thead>
               <tr className="border-b border-white/[0.07] text-left text-xs text-[#8A8496]">
-                <th className="px-4 py-3 font-medium">Game</th>
-                <th className="px-4 py-3 font-medium">Code</th>
-                <th className="px-4 py-3 font-medium">Type</th>
+                <SortHeader label="Game" sortKey="game" activeSort={sort} onSort={handleSort} />
+                <SortHeader label="Code" sortKey="code" activeSort={sort} onSort={handleSort} />
+                <SortHeader label="Type" sortKey="type" activeSort={sort} onSort={handleSort} />
                 <th className="px-4 py-3 font-medium">Rewards</th>
-                <th className="px-4 py-3 font-medium">Expiry</th>
+                <SortHeader label="Expiry" sortKey="expiry" activeSort={sort} onSort={handleSort} />
                 <th className="px-4 py-3 font-medium">Action</th>
               </tr>
             </thead>
             <tbody>
-              {rows.map((item, i) => {
-                const meta = GAME_META[item.game];
+              {pageRows.map((item, i) => {
+                const meta = GAME_META[item.game] ?? { short: item.game, hue: "#8A8496", tint: "rgba(138,132,150,0.14)" };
                 return (
                   <tr
                     key={item.id}
@@ -278,7 +386,7 @@ export default function GachaCodeTracker() {
                     <td className="px-4 py-3 font-mono text-[13px] text-[#F3F1F8]">{item.code}</td>
                     <td className="px-4 py-3"><TypeBadge type={item.code_type} /></td>
                     <td className="px-4 py-3 max-w-[220px] text-[#B7B2C6]">{item.rewards}</td>
-                    <td className="px-4 py-3"><ExpiryBadge expiresAt={item.expires_at} /></td>
+                    <td className="px-4 py-3"><ExpiryBadge expiresAt={item.expires_at} codeType={item.code_type} /></td>
                     <td className="px-4 py-3"><ActionButton item={item} /></td>
                   </tr>
                 );
@@ -291,8 +399,8 @@ export default function GachaCodeTracker() {
         {/* Mobile stacked cards (NFR-4) */}
         {!loading && (
         <div className="flex flex-col gap-3 md:hidden">
-          {rows.map((item) => {
-            const meta = GAME_META[item.game];
+          {pageRows.map((item) => {
+            const meta = GAME_META[item.game] ?? { short: item.game, hue: "#8A8496", tint: "rgba(138,132,150,0.14)" };
             return (
               <div key={item.id} className="rounded-xl border border-white/[0.07] p-4" style={{ background: "rgba(255,255,255,0.02)" }}>
                 <div className="mb-2.5 flex items-center justify-between">
@@ -307,7 +415,7 @@ export default function GachaCodeTracker() {
                 <div className="mb-1 font-mono text-[15px] font-medium text-[#F3F1F8]">{item.code}</div>
                 <div className="mb-3 text-sm text-[#B7B2C6]">{item.rewards}</div>
                 <div className="flex items-center justify-between">
-                  <ExpiryBadge expiresAt={item.expires_at} />
+                  <ExpiryBadge expiresAt={item.expires_at} codeType={item.code_type} />
                   <ActionButton item={item} />
                 </div>
               </div>
@@ -316,9 +424,35 @@ export default function GachaCodeTracker() {
         </div>
         )}
 
-        {!loading && rows.length === 0 && (
+        {!loading && sortedRows.length === 0 && (
           <div className="rounded-xl border border-white/[0.07] py-12 text-center text-sm text-[#8A8496]">
-            No active codes for this game right now — check back after the next scrape.
+            {search ? "No codes match your search." : "No active codes for this game right now — check back after the next scrape."}
+          </div>
+        )}
+
+        {/* Pagination */}
+        {!loading && sortedRows.length > 0 && (
+          <div className="mt-4 flex items-center justify-between text-xs text-[#8A8496]">
+            <span>
+              Showing {(clampedPage - 1) * pageSize + 1}-{Math.min(clampedPage * pageSize, sortedRows.length)} of {sortedRows.length}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={clampedPage === 1}
+                className="flex items-center gap-1 rounded-md border border-white/[0.08] px-2.5 py-1.5 transition-colors disabled:opacity-30 enabled:hover:bg-white/[0.05] enabled:text-[#F3F1F8]"
+              >
+                <ChevronLeft size={13} /> Prev
+              </button>
+              <span className="px-1">Page {clampedPage} of {totalPages}</span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={clampedPage === totalPages}
+                className="flex items-center gap-1 rounded-md border border-white/[0.08] px-2.5 py-1.5 transition-colors disabled:opacity-30 enabled:hover:bg-white/[0.05] enabled:text-[#F3F1F8]"
+              >
+                Next <ChevronRight size={13} />
+              </button>
+            </div>
           </div>
         )}
       </div>
