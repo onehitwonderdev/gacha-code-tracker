@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import {
-  Copy, Check, ExternalLink, Clock, Gift, Loader2,
+  Copy, Check, ExternalLink, Clock, Gift, Loader2, AlertCircle,
   Search, ArrowUp, ArrowDown, ArrowUpDown, ChevronLeft, ChevronRight,
 } from "lucide-react";
 
@@ -11,8 +11,8 @@ import {
 // access your RLS policies grant it (see supabase_setup.sql - the
 // "Public can read game codes" policy is what makes this work).
 // ---------------------------------------------------------------------------
-const SUPABASE_URL = "https://YOUR_PROJECT_REF.supabase.co";
-const SUPABASE_ANON_KEY = "YOUR_PUBLISHABLE_KEY";
+const SUPABASE_URL = "https://zgzbchsuzjxronkzrlwk.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_c5eCZcct5rbOkdgoSPrU8Q_r6u_54Lz";
 
 // Legacy `anon` keys are JWTs and need Authorization: Bearer; new
 // sb_publishable_... keys are opaque and only need the apikey header
@@ -26,26 +26,6 @@ function supabaseHeaders() {
   return headers;
 }
 
-// ---------------------------------------------------------------------------
-// Fallback sample data - shown automatically if the constants above are
-// still placeholders, or if the live fetch fails, so this component never
-// renders empty.
-// ---------------------------------------------------------------------------
-const MOCK_CODES = [
-  { id: 1, game: "HSR", code: "SPACE2026JADE", code_type: "LIVESTREAM", rewards: "300 Stellar Jades, 50000 Credits", status: "ACTIVE", expires_at: hoursFromNow(9), direct_redeem_url: "https://hsr.hoyoverse.com/gift?code=SPACE2026JADE" },
-  { id: 2, game: "ZZZ", code: "PROXYUPDATE21", code_type: "VERSION", rewards: "200 Polychromes, 20000 Dennies", status: "ACTIVE", expires_at: daysFromNow(12), direct_redeem_url: "https://zenless.hoyoverse.com/redemption?code=PROXYUPDATE21" },
-  { id: 3, game: "WUWA", code: "RESONATOR88", code_type: "PROMO", rewards: "150 Astrites, 10 Advanced Tuners", status: "ACTIVE", expires_at: daysFromNow(4), direct_redeem_url: null },
-  { id: 4, game: "HSR", code: "STARRAILGIFT", code_type: "PERMANENT", rewards: "50 Stellar Jades, 10000 Credits", status: "ACTIVE", expires_at: null, direct_redeem_url: "https://hsr.hoyoverse.com/gift?code=STARRAILGIFT" },
-  { id: 5, game: "ZZZ", code: "ZENLESSGIFT", code_type: "PERMANENT", rewards: "50 Polychromes", status: "ACTIVE", expires_at: null, direct_redeem_url: "https://zenless.hoyoverse.com/redemption?code=ZENLESSGIFT" },
-  { id: 6, game: "WUWA", code: "WUTHERINGGIFT", code_type: "PERMANENT", rewards: "50 Astrites", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
-  { id: 7, game: "HSR", code: "HSRTWITCHDROP", code_type: "PROMO", rewards: "1 Stellar Jade x40 pull ticket bundle", status: "ACTIVE", expires_at: daysFromNow(2), direct_redeem_url: "https://hsr.hoyoverse.com/gift?code=HSRTWITCHDROP" },
-  { id: 8, game: "WUWA", code: "TIDALWAVE500", code_type: "LIVESTREAM", rewards: "500 Astrites, 100000 Shell Credits", status: "ACTIVE", expires_at: hoursFromNow(14), direct_redeem_url: null },
-  { id: 9, game: "WUWA", code: "DCARD3VN7M", code_type: "PROMO", rewards: "Rewards unspecified - check source", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
-  { id: 10, game: "WUWA", code: "BAHAMUTKXMHM", code_type: "PROMO", rewards: "Rewards unspecified - check source", status: "ACTIVE", expires_at: null, direct_redeem_url: null },
-];
-
-function hoursFromNow(h) { return new Date(Date.now() + h * 3600 * 1000).toISOString(); }
-function daysFromNow(d) { return new Date(Date.now() + d * 86400 * 1000).toISOString(); }
 
 const GAME_META = {
   HSR:  { label: "Honkai: Star Rail", short: "HSR",  hue: "#8B6FE0", tint: "rgba(139,111,224,0.14)" },
@@ -174,7 +154,7 @@ export default function GachaCodeTracker() {
   const [tab, setTab] = useState("ALL");
   const [codes, setCodes] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [usingMock, setUsingMock] = useState(false);
+  const [error, setError] = useState(null);
 
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState({ key: "urgency", dir: "asc" });
@@ -185,8 +165,7 @@ export default function GachaCodeTracker() {
     const isPlaceholder = SUPABASE_URL.includes("YOUR_PROJECT_REF") || SUPABASE_ANON_KEY.includes("YOUR_PUBLISHABLE_KEY");
 
     if (isPlaceholder) {
-      setCodes(MOCK_CODES);
-      setUsingMock(true);
+      setError("Supabase isn't configured yet. Add your project URL and publishable key at the top of this file.");
       setLoading(false);
       return;
     }
@@ -200,12 +179,11 @@ export default function GachaCodeTracker() {
       })
       .then((data) => {
         setCodes(data);
-        setUsingMock(false);
+        setError(null);
       })
       .catch((err) => {
-        console.error("Falling back to sample data:", err);
-        setCodes(MOCK_CODES);
-        setUsingMock(true);
+        console.error("Failed to load codes:", err);
+        setError(`Couldn't load codes (${err.message}). Check your Supabase URL/key, your network connection, and that the game_codes table is reachable, then refresh.`);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -291,13 +269,14 @@ export default function GachaCodeTracker() {
           </div>
         </div>
 
-        {/* Sample-data notice */}
-        {usingMock && !loading && (
+        {/* Note - shown when there's no live data to display, with the real reason why */}
+        {error && !loading && (
           <div
-            className="mb-5 rounded-lg border px-3.5 py-2.5 text-xs"
+            className="mb-5 flex items-start gap-2 rounded-lg border px-3.5 py-2.5 text-xs"
             style={{ borderColor: "rgba(228,180,74,0.35)", background: "rgba(228,180,74,0.08)", color: "#E4B44A" }}
           >
-            Showing sample data. Add your Supabase project URL and publishable key at the top of this file to connect live codes.
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <span>{error}</span>
           </div>
         )}
 
@@ -426,7 +405,11 @@ export default function GachaCodeTracker() {
 
         {!loading && sortedRows.length === 0 && (
           <div className="rounded-xl border border-white/[0.07] py-12 text-center text-sm text-[#8A8496]">
-            {search ? "No codes match your search." : "No active codes for this game right now — check back after the next scrape."}
+            {error
+              ? "No codes to show until this is connected — see the note above."
+              : search
+              ? "No codes match your search."
+              : "No active codes for this game right now — check back after the next scrape."}
           </div>
         )}
 
