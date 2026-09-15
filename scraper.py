@@ -58,7 +58,7 @@ HEADERS = {
 }
 
 # Uppercase alphanumeric, 6-16 chars - typical gacha code shape.
-CODE_REGEX = re.compile(r"\b[A-Z0-9]{6,16}\b")
+CODE_REGEX = re.compile(r"\b[A-Z0-9]{5,24}\b")
 
 # Words that match the regex shape but are never actual codes.
 # The COPIED/REDEEM/HERE entries are defense-in-depth for Game8's button
@@ -217,7 +217,7 @@ def _section_status_for(tag) -> str:
     don't check which one a code came from, an expired code gets scraped as ACTIVE.
     """
     EXPIRED_WORDS = ("expired", "inactive", "old code", "no longer")
-    for heading in tag.find_all_previous(["h2", "h3", "h4"]):
+    for heading in tag.find_all_previous(["h2", "h3", "h4", "th"]):
         heading_text = heading.get_text(" ", strip=True).lower()
         if any(w in heading_text for w in EXPIRED_WORDS):
             return "EXPIRED"
@@ -301,7 +301,7 @@ def fetch_game8_codes(game_id: str, url: str) -> list[dict]:
             # false-positive code-shaped tokens. CODE_REGEX is already
             # case-sensitive (uppercase-only), so scanning the raw cell text
             # naturally picks out just the genuinely-uppercase code itself.
-            cell_text = cell.get_text(" ", strip=True)
+            cell_text = cell.get_text(" ", strip=True).upper()
             for code_text in CODE_REGEX.findall(cell_text):
                 if code_text in FALSE_POSITIVES:
                     continue
