@@ -3,6 +3,12 @@ Gacha Code Tracker - Phase 1: Scraping & Ingestion Engine
 Implements FR-1 (multi-source polling), FR-2 (dedup), FR-4 (classification)
 against the `game_codes` schema defined in the PDR (Section 5).
 
+Sources polled per game (FR-1): Reddit (fastest, noisiest - best-effort
+active/expired keyword detection only), the Fandom wiki (curated, has a
+real active/expired table split), and Game8 (curated, also has a real
+active/expired table split - a second reliable, independently-maintained
+source alongside the wiki, per game in GAMES[game]["game8_url"]).
+
 Requires:
     pip install requests beautifulsoup4
 
@@ -27,16 +33,22 @@ GAMES = {
         "reddit": "HonkaiStarRail",
         "wiki_url": "https://honkai-star-rail.fandom.com/api.php",
         "wiki_page": "Redemption_Code",
+        # Game8's evergreen monthly code roundup - same article ID persists
+        # across version updates (they edit it in place rather than posting
+        # a new URL each patch), so this is safe to poll indefinitely.
+        "game8_url": "https://game8.co/games/Honkai-Star-Rail/archives/410296",
     },
     "ZZZ": {
         "reddit": "ZenlessZoneZero",
         "wiki_url": "https://zenless-zone-zero.fandom.com/api.php",
         "wiki_page": "Redemption_Code",
+        "game8_url": "https://game8.co/games/Zenless-Zone-Zero/archives/435683",
     },
     "WUWA": {
         "reddit": "WutheringWaves",
         "wiki_url": "https://wutheringwaves.fandom.com/api.php",
         "wiki_page": "Redemption_Code",
+        "game8_url": "https://game8.co/games/Wuthering-Waves/archives/453149",
     },
 }
 
@@ -49,7 +61,13 @@ HEADERS = {
 CODE_REGEX = re.compile(r"\b[A-Z0-9]{6,16}\b")
 
 # Words that match the regex shape but are never actual codes.
-FALSE_POSITIVES = {"LIVESTREAM", "UPDATE", "REDDIT", "YOUTUBE", "TWITTER", "OFFICIAL"}
+# The COPIED/REDEEM/HERE entries are defense-in-depth for Game8's button
+# chrome ("Copied / Redeem <CODE> Here") in case a future markup change ever
+# puts that text through .upper() before matching.
+FALSE_POSITIVES = {
+    "LIVESTREAM", "UPDATE", "REDDIT", "YOUTUBE", "TWITTER", "OFFICIAL",
+    "COPIED", "REDEEM", "HERE",
+}
 
 # Permanent starter codes called out explicitly in the PDR (Section 2, Returning Player persona).
 # These are seeded once and should never trigger email alerts (FR-10).
@@ -125,6 +143,18 @@ def extract_rewards(title: str, text: str) -> str:
 # FR-1: Source fetchers
 # --------------------------------------------------------------------------
 
+
+# Reddit posts that explicitly call a code out as dead - either via flair
+# (some subs tag threads "Expired"/"Outdated" once confirmed) or in the
+# title/body itself (a very common phrasing on megathreads and follow-up
+# comments-turned-posts).
+REDDIT_EXPIRED_FLAIRS = ("expired", "outdated", "inactive")
+REDDIT_EXPIRED_PHRASES = (
+    "expired", "no longer works", "doesn't work anymore", "does not work anymore",
+    "already expired", "code is dead", "codes are dead",
+)
+
+
 def fetch_reddit_codes(game_id: str, subreddit: str) -> list[dict]:
     """Scrapes the latest posts from a subreddit looking for codes."""
     url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=25"
@@ -139,9 +169,27 @@ def fetch_reddit_codes(game_id: str, subreddit: str) -> list[dict]:
             data = post["data"]
             title = data.get("title", "")
             text = data.get("selftext", "")
+            flair = (data.get("link_flair_text") or "").lower()
 
             if not any(k in title.lower() for k in ("code", "redeem", "livestream", "gem")):
                 continue
+
+            # FR-2 fix: this used to hardcode status="ACTIVE" for every code
+            # found on Reddit, regardless of what the post actually said.
+            # That's wrong for reposts/aggregator threads and for posts made
+            # specifically to warn people a code died - both are common here.
+            # Reddit doesn't give us a structured active/expired signal like
+            # the wiki's table sections do, so this is a best-effort keyword
+            # check on the flair + title + body; dedupe() still lets a
+            # wiki/Game8 EXPIRED verdict override an ACTIVE guess from here,
+            # but not vice versa, so false negatives here are the safer
+            # failure mode than false positives.
+            blob = f"{title} {text}".lower()
+            is_expired = (
+                any(w in flair for w in REDDIT_EXPIRED_FLAIRS)
+                or any(p in blob for p in REDDIT_EXPIRED_PHRASES)
+            )
+            status = "EXPIRED" if is_expired else "ACTIVE"
 
             matches = set(CODE_REGEX.findall(title) + CODE_REGEX.findall(text))
             for code in matches:
@@ -153,7 +201,7 @@ def fetch_reddit_codes(game_id: str, subreddit: str) -> list[dict]:
                     "code_type": classify_code(game_id, code, title, text),
                     "rewards": extract_rewards(title, text),
                     "source_url": f"https://reddit.com{data.get('permalink')}",
-                    "status": "ACTIVE",  # freshly posted - assume active at time of discovery
+                    "status": status,
                 })
     except Exception as e:
         print(f"[!] Reddit fetch failed for {game_id}: {e}")
@@ -215,6 +263,66 @@ def fetch_wiki_codes(game_id: str, api_url: str, page_title: str) -> list[dict]:
             })
     except Exception as e:
         print(f"[!] Wiki fetch failed for {game_id}: {e}")
+
+    return found
+
+
+def fetch_game8_codes(game_id: str, url: str) -> list[dict]:
+    """
+    Fetches a Game8 redeem-code guide page directly (Game8 has no public API,
+    unlike the Fandom wikis, so this is a plain HTML GET + parse).
+
+    Game8's code guides use the same layout convention Fandom does: an
+    "Active/current codes" table, followed further down the page by an
+    "All Expired ... Codes" table - so _section_status_for's heading-walk
+    (originally written for the Fandom wiki fetcher) applies unchanged here
+    too. The one real difference is that Game8 doesn't wrap codes in <code>
+    tags - they're just plain text in table cells - so we scan <td> cells
+    instead.
+
+    This is added as a second, independently-maintained reliable source
+    alongside the wiki: Game8 pages are curated/edited by staff, get taken
+    down or corrected quickly when a code stops working, and give us a
+    genuine expired-codes table rather than the Reddit fetcher's best-effort
+    keyword guess.
+    """
+    found = []
+
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for cell in soup.find_all("td"):
+            # NOTE: deliberately NOT upper()-ing the whole cell before
+            # matching. Game8's code cells aren't bare code text - they're
+            # "Copied / Redeem <CODE> Here" button chrome around the code.
+            # Upper-casing first would turn "Copied"/"Redeem"/"Here" into
+            # false-positive code-shaped tokens. CODE_REGEX is already
+            # case-sensitive (uppercase-only), so scanning the raw cell text
+            # naturally picks out just the genuinely-uppercase code itself.
+            cell_text = cell.get_text(" ", strip=True)
+            for code_text in CODE_REGEX.findall(cell_text):
+                if code_text in FALSE_POSITIVES:
+                    continue
+
+                row_text = ""
+                parent_row = cell.find_parent("tr")
+                if parent_row:
+                    row_text = parent_row.get_text(" ", strip=True)
+
+                status = _section_status_for(cell)
+
+                found.append({
+                    "game": game_id,
+                    "code": code_text,
+                    "code_type": classify_code(game_id, code_text, "", row_text),
+                    "rewards": extract_rewards("", row_text),
+                    "source_url": url,
+                    "status": status,
+                })
+    except Exception as e:
+        print(f"[!] Game8 fetch failed for {game_id}: {e}")
 
     return found
 
@@ -354,6 +462,7 @@ def run_pipeline():
         print(f"Fetching data for {game}...")
         master_list.extend(fetch_reddit_codes(game, config["reddit"]))
         master_list.extend(fetch_wiki_codes(game, config["wiki_url"], config["wiki_page"]))
+        master_list.extend(fetch_game8_codes(game, config["game8_url"]))
 
     final_rows = dedupe(master_list)
     print(f"Pipeline complete. Discovered {len(final_rows)} unique candidate codes.")
